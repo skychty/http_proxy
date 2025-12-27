@@ -19,7 +19,7 @@ from crypto_utils import decrypt_json, encrypt_json
 
 # 配置日志
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -27,6 +27,285 @@ logger = logging.getLogger(__name__)
 # 禁用SSL警告
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# PROXY Protocol v2 签名
+PROXY_PROTOCOL_V2_SIGNATURE = b'\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A'
+
+class BufferedStreamReader:
+    """
+    带缓冲的StreamReader包装器，支持数据回退
+    用于PROXY Protocol检测：如果不是PROXY Protocol，可以将数据回退
+    """
+    def __init__(self, reader: asyncio.StreamReader):
+        self.reader = reader
+        self.buffer = b''
+    
+    async def readexactly(self, n: int) -> bytes:
+        """读取恰好n字节，优先从缓冲区读取"""
+        if len(self.buffer) >= n:
+            # 缓冲区有足够数据
+            result = self.buffer[:n]
+            self.buffer = self.buffer[n:]
+            return result
+        elif len(self.buffer) > 0:
+            # 缓冲区有部分数据，需要从reader读取剩余部分
+            needed = n - len(self.buffer)
+            try:
+                data = self.buffer + await self.reader.readexactly(needed)
+                self.buffer = b''
+                return data
+            except asyncio.IncompleteReadError as e:
+                # 底层reader读取不完整，将已读取的数据保存到缓冲区
+                if e.partial:
+                    # e.partial 包含从底层reader读取的部分数据
+                    # 我们需要将缓冲区中的数据 + e.partial 都保存回缓冲区
+                    self.buffer = self.buffer + e.partial
+                raise  # 重新抛出异常，让上层处理
+        else:
+            # 缓冲区为空，直接从reader读取
+            try:
+                return await self.reader.readexactly(n)
+            except asyncio.IncompleteReadError as e:
+                # 底层reader读取不完整，将已读取的数据保存到缓冲区
+                if e.partial:
+                    self.buffer = e.partial
+                raise  # 重新抛出异常，让上层处理
+    
+    def unread(self, data: bytes):
+        """将数据放回缓冲区（用于回退）"""
+        self.buffer = data + self.buffer
+    
+    def get_buffer(self) -> bytes:
+        """获取当前缓冲区内容"""
+        return self.buffer
+    
+    def clear_buffer(self):
+        """清空缓冲区"""
+        self.buffer = b''
+
+async def _safe_read(reader: BufferedStreamReader, n: int, timeout: float = 1.0) -> Tuple[Optional[bytes], bool]:
+    """
+    安全读取数据，捕获连接重置异常（可能是健康检查）
+    
+    Returns:
+        (data, connection_reset)
+        - data: 读取到的数据，如果连接被重置或数据不完整返回None
+        - connection_reset: 如果连接被重置返回True，否则返回False
+        注意：如果数据不完整，BufferedStreamReader已经将部分数据保存到缓冲区
+    """
+    try:
+        return await asyncio.wait_for(reader.readexactly(n), timeout=timeout), False
+    except (ConnectionResetError, BrokenPipeError, OSError) as e:
+        # 连接在读取时被重置（可能是健康检查）
+        logger.debug(f"PROXY Protocol检测: 连接在读取时被重置（可能是健康检查）: {e}")
+        return None, True  # 连接被重置
+    except asyncio.IncompleteReadError as e:
+        # 数据不完整（可能是连接被重置）
+        # BufferedStreamReader已经将部分数据保存到缓冲区，这里只需要记录日志
+        logger.debug(f"PROXY Protocol检测: 数据不完整，期望{n}字节，实际读取{len(e.partial) if e.partial else 0}字节，已保存到缓冲区")
+        # IncompleteReadError 通常也表示连接被关闭
+        return None, True  # 连接被关闭
+    except asyncio.TimeoutError:
+        # 读取超时，连接仍然有效，只是没有数据
+        logger.debug(f"PROXY Protocol检测: 读取超时（连接仍然有效）")
+        return None, False  # 连接仍然有效
+
+async def parse_proxy_protocol_v2(reader: BufferedStreamReader) -> Tuple[Optional[Tuple[str, int]], bool]:
+    """
+    解析 PROXY Protocol v2 头，获取真实客户端IP和端口
+    
+    Args:
+        reader: BufferedStreamReader对象
+    
+    Returns:
+        (result, connection_reset)
+        - result: 如果成功解析，返回 (client_ip, client_port) 元组；如果解析失败或不是PROXY Protocol，返回None
+        - connection_reset: 如果连接被重置返回True，否则返回False（已读取的数据会自动回退）
+    """
+    # 使用临时缓冲区保存所有读取的数据，如果解析失败则全部回退
+    read_data = b''
+    
+    try:
+        # 读取12字节签名
+        signature, connection_reset = await _safe_read(reader, 12, timeout=1.0)
+        if signature is None:
+            # 连接被重置或数据不完整，视为无PROXY Protocol
+            # 如果连接被重置，直接返回
+            if connection_reset:
+                # 如果缓冲区有数据（部分读取），需要清空
+                buffer_data = reader.get_buffer()
+                if buffer_data:
+                    reader.clear_buffer()
+                if read_data:
+                    reader.unread(read_data)
+                return None, True  # 连接被重置
+            # 读取超时，连接仍然有效，只是没有PROXY Protocol
+            buffer_data = reader.get_buffer()
+            if buffer_data:
+                logger.debug(f"PROXY Protocol检测失败: 缓冲区有 {len(buffer_data)} 字节残留数据，清空缓冲区")
+                reader.clear_buffer()
+            if read_data:
+                reader.unread(read_data)
+            logger.debug(f"PROXY Protocol检测失败: 返回 None, False (读取超时或数据不完整)")
+            return None, False  # 连接仍然有效，只是没有PROXY Protocol
+        read_data += signature
+        
+        logger.debug(f"PROXY Protocol检测: 读取到签名={signature.hex()}, 期望签名={PROXY_PROTOCOL_V2_SIGNATURE.hex()}, 匹配={signature == PROXY_PROTOCOL_V2_SIGNATURE}")
+        
+        # 检查是否是PROXY Protocol v2
+        if signature != PROXY_PROTOCOL_V2_SIGNATURE:
+            # 不是PROXY Protocol，将数据回退到缓冲区
+            # 但前4字节匹配，可能是部分PROXY Protocol数据，需要特别处理
+            if signature[:4] == PROXY_PROTOCOL_V2_SIGNATURE[:4]:
+                # 前4字节匹配，但完整签名不匹配
+                # 如果读取的数据少于12字节，可能是部分数据，应该视为连接被重置
+                if len(signature) < 12:
+                    logger.warning(f"PROXY Protocol检测: 前4字节匹配但只读取了{len(signature)}字节（期望12字节），可能是部分数据，连接可能被重置")
+                    reader.unread(read_data)
+                    return None, True  # 连接可能被重置
+                else:
+                    # 读取了12字节但签名不匹配，可能是格式错误
+                    logger.warning(f"PROXY Protocol检测: 前4字节匹配但完整签名不匹配，可能是格式错误。读取到的={signature.hex()}, 期望={PROXY_PROTOCOL_V2_SIGNATURE.hex()}")
+            logger.debug(f"PROXY Protocol检测失败: 签名不匹配，回退 {len(read_data)} 字节数据")
+            reader.unread(read_data)
+            return None, False  # 连接仍然有效，只是不是PROXY Protocol
+        
+        # 读取版本和命令（1字节）
+        version_command, connection_reset = await _safe_read(reader, 1, timeout=1.0)
+        if version_command is None:
+            if connection_reset:
+                reader.unread(read_data)
+                return None, True  # 连接被重置
+            reader.unread(read_data)
+            return None, False  # 连接仍然有效
+        read_data += version_command
+        # version_command 是 bytes，需要转换为整数
+        version_command_int = version_command[0] if isinstance(version_command, bytes) else version_command
+        version = (version_command_int >> 4) & 0x0F
+        command = version_command_int & 0x0F
+        logger.debug(f"PROXY Protocol检测: 解析版本和命令: version={version}, command={command} (0x0=LOCAL, 0x1=PROXY)")
+        
+        # 只处理v2版本
+        if version != 2:
+            # 不是v2版本，回退数据
+            logger.warning(f"PROXY Protocol检测: 前4字节匹配但版本不对 (version={version})，可能是格式错误")
+            reader.unread(read_data)
+            return None, False  # 连接仍然有效，只是不是PROXY Protocol v2
+        
+        # 处理LOCAL命令（0x0）和PROXY命令（0x1）
+        # LOCAL命令（0x0）表示连接没有经过代理，需要跳过地址数据
+        # PROXY命令（0x1）表示连接经过代理，需要解析地址数据
+        if command == 0x0:
+            # LOCAL命令：跳过地址数据，继续处理后续数据
+            logger.debug(f"PROXY Protocol检测: LOCAL命令（连接未经过代理），跳过地址数据")
+            # 读取协议族和地址长度（1字节）
+            family_protocol, connection_reset = await _safe_read(reader, 1, timeout=1.0)
+            if family_protocol is None:
+                if connection_reset:
+                    reader.unread(read_data)
+                    return None, True  # 连接被重置
+                reader.unread(read_data)
+                return None, False  # 连接仍然有效
+            read_data += family_protocol
+            
+            # 读取地址长度（2字节）
+            addr_len_bytes, connection_reset = await _safe_read(reader, 2, timeout=1.0)
+            if addr_len_bytes is None:
+                if connection_reset:
+                    reader.unread(read_data)
+                    return None, True  # 连接被重置
+                reader.unread(read_data)
+                return None, False  # 连接仍然有效
+            read_data += addr_len_bytes
+            addr_len = int.from_bytes(addr_len_bytes, 'big')
+            
+            # 跳过地址数据
+            if addr_len > 0:
+                addr_data, connection_reset = await _safe_read(reader, addr_len, timeout=1.0)
+                if addr_data is None:
+                    if connection_reset:
+                        reader.unread(read_data)
+                        return None, True  # 连接被重置
+                    reader.unread(read_data)
+                    return None, False  # 连接仍然有效
+                read_data += addr_data
+            
+            # LOCAL命令处理完成，返回None表示没有真实客户端IP，继续处理后续数据
+            logger.debug(f"PROXY Protocol检测: LOCAL命令处理完成，跳过 {len(read_data)} 字节，返回 None, False (没有真实客户端IP，但连接仍然有效)")
+            return None, False  # 连接仍然有效，只是没有真实客户端IP
+        elif command != 0x1:
+            # 不是LOCAL或PROXY命令，可能是格式错误
+            logger.warning(f"PROXY Protocol检测: 前4字节匹配但命令不对 (command={command}, 期望0x0=LOCAL或0x1=PROXY)，可能是格式错误")
+            reader.unread(read_data)
+            return None, True  # 视为连接问题，直接退出
+        
+        # 读取协议族和地址长度（1字节）
+        family_protocol, connection_reset = await _safe_read(reader, 1, timeout=1.0)
+        if family_protocol is None:
+            if connection_reset:
+                reader.unread(read_data)
+                return None, True  # 连接被重置
+            reader.unread(read_data)
+            return None, False  # 连接仍然有效
+        read_data += family_protocol
+        # family_protocol 是 bytes，需要转换为整数
+        family_protocol_int = family_protocol[0] if isinstance(family_protocol, bytes) else family_protocol
+        family = (family_protocol_int >> 4) & 0x0F  # 0x1=IPv4, 0x2=IPv6
+        protocol = family_protocol_int & 0x0F  # 0x1=TCP, 0x2=UDP
+        
+        # 读取地址长度（2字节，大端）
+        addr_len_data, connection_reset = await _safe_read(reader, 2, timeout=1.0)
+        if addr_len_data is None:
+            if connection_reset:
+                reader.unread(read_data)
+                return None, True  # 连接被重置
+            reader.unread(read_data)
+            return None, False  # 连接仍然有效
+        read_data += addr_len_data
+        addr_len = struct.unpack('!H', addr_len_data)[0]
+        
+        # 读取地址数据
+        addr_data, connection_reset = await _safe_read(reader, addr_len, timeout=1.0)
+        if addr_data is None:
+            if connection_reset:
+                reader.unread(read_data)
+                return None, True  # 连接被重置
+            reader.unread(read_data)
+            return None, False  # 连接仍然有效
+        read_data += addr_data
+        
+        # 解析IPv4地址
+        if family == 0x1 and protocol == 0x1 and addr_len == 12:
+            # IPv4 TCP: 4字节源IP + 4字节目标IP + 2字节源端口 + 2字节目标端口
+            src_ip_bytes = addr_data[0:4]
+            src_port_bytes = addr_data[8:10]
+            
+            # 转换为IP地址和端口
+            src_ip = '.'.join(str(b) for b in src_ip_bytes)
+            src_port = struct.unpack('!H', src_port_bytes)[0]
+            
+            logger.info(f"PROXY Protocol v2解析成功: 客户端IP={src_ip}, 端口={src_port}")
+            return (src_ip, src_port), False  # 连接仍然有效
+        
+        # IPv6或其他协议暂不支持，回退所有数据
+        logger.debug(f"PROXY Protocol v2: 不支持的协议族或协议 (family={family}, protocol={protocol}, addr_len={addr_len})")
+        reader.unread(read_data)
+        return None, False  # 连接仍然有效，只是不支持
+        
+    except Exception as e:
+        # 发生异常，回退已读取的数据
+        # 注意：_safe_read 已经处理了大部分异常，这里主要是处理其他未预期的异常
+        logger.warning(f"解析PROXY Protocol时出错: {e}，已读取 {len(read_data)} 字节，回退数据")
+        if read_data:
+            # 如果已读取的数据的前4字节匹配 PROXY Protocol 签名，说明这可能是PROXY Protocol数据
+            # 直接退出，不回退数据（避免影响后续处理）
+            if len(read_data) >= 4 and read_data[:4] == PROXY_PROTOCOL_V2_SIGNATURE[:4]:
+                logger.warning(f"PROXY Protocol检测: 前4字节匹配但解析出错，可能是格式错误，直接退出")
+                reader.unread(read_data)
+                return None, True  # 视为连接问题，直接退出
+            reader.unread(read_data)
+        return None, False  # 假设连接仍然有效
+
 
 # Magic number用于客户端有效性检查
 # 使用8字节动态magic：前4字节随机，后4字节由前4字节通过算法计算得出
@@ -216,7 +495,7 @@ class HTTPSProxyServer:
         # 测试超时计数
         self.test_timeout_cnt = 1
     
-    async def receive_packet(self, reader: asyncio.StreamReader) -> Tuple[Optional[bytes], Optional[str]]:
+    async def receive_packet(self, reader) -> Tuple[Optional[bytes], Optional[str]]:
         """
         接收一个完整的数据包
         数据包格式：8字节magic（前4字节随机+后4字节算法计算） + 4字节包长（大端） + 包数据
@@ -268,6 +547,10 @@ class HTTPSProxyServer:
             else:
                 # 完全未接收数据，可能是正常关闭
                 return None, 'normal_close'
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            # 连接被重置或断开
+            logger.debug(f"接收数据包时连接被重置: {e}")
+            return None, 'connection_reset'
         except Exception as e:
             logger.error(f"接收数据包时出错: {e}")
             return None, 'exception'
@@ -330,7 +613,7 @@ class HTTPSProxyServer:
                 response_json = {
                     'status_code': 400,
                     'headers': {},
-                    'body': 'Missing URL in request'
+                    'body': ''
                 }
                 encrypted_response = encrypt_json(response_json)
                 return encrypted_response
@@ -339,7 +622,7 @@ class HTTPSProxyServer:
             logger.info(f"[{client_info}] {method} {url}")
             
             # 3. 发送HTTPS请求（阻塞IO操作）
-            response_json = self.make_https_request(url, headers, post_data, client_info)
+            response_json = self.make_https_request(url, headers, post_data, client_info, client_address)
             
             # 4. 加密响应数据（CPU密集型操作）
             encrypted_response = encrypt_json(response_json)
@@ -361,7 +644,7 @@ class HTTPSProxyServer:
             response_json = {
                 'status_code': 400,
                 'headers': {},
-                'body': f'JSON decode error: {str(e)}'
+                'body': ''
             }
             encrypted_response = encrypt_json(response_json)
             total_duration = time.time() - request_start_time
@@ -374,14 +657,14 @@ class HTTPSProxyServer:
             response_json = {
                 'status_code': 500,
                 'headers': {},
-                'body': f'Server error: {str(e)}'
+                'body': ''
             }
             encrypted_response = encrypt_json(response_json)
             total_duration = time.time() - request_start_time
             logger.info(f"[{client_info}] 请求处理失败 -> 500 ({total_duration:.3f}s)")
             return encrypted_response
     
-    def make_https_request(self, url: str, headers: dict = None, post_data: str = None, client_info: str = None) -> dict:
+    def make_https_request(self, url: str, headers: dict = None, post_data: str = None, client_info: str = None, client_address: Tuple = None) -> dict:
         """
         发送HTTPS请求（在线程池中执行）
         
@@ -390,6 +673,7 @@ class HTTPSProxyServer:
             headers: 请求头
             post_data: POST数据
             client_info: 客户端信息（用于日志记录）
+            client_address: 客户端地址元组 (ip, port)
         
         Returns:
             包含响应数据的字典
@@ -398,6 +682,11 @@ class HTTPSProxyServer:
         try:
             # 准备请求头
             request_headers = headers.copy() if headers else {}
+            
+            # 添加 X-Forwarded-For header，值为客户端公网IP
+            if client_address:
+                client_ip = client_address[0]
+                request_headers['X-Forwarded-For'] = client_ip
             
             # 发送请求
             if post_data:
@@ -435,7 +724,7 @@ class HTTPSProxyServer:
             return {
                 'status_code': 504,
                 'headers': {},
-                'body': f'Request timeout: {url}'
+                'body': ''
             }
         except Exception as e:
             duration = time.time() - start_time
@@ -445,7 +734,7 @@ class HTTPSProxyServer:
             return {
                 'status_code': 500,
                 'headers': {},
-                'body': f'Request failed: {str(e)}'
+                'body': ''
             }
     
     async def worker_loop(self, worker_id: int):
@@ -478,7 +767,7 @@ class HTTPSProxyServer:
                         encrypted_response = encrypt_json({
                             'status_code': 500,
                             'headers': {},
-                            'body': f'Server error: {str(e)}'
+                            'body': ''
                         })
                     except Exception as encrypt_error:
                         logger.error(f"加密错误响应时出错: {encrypt_error}")
@@ -516,18 +805,49 @@ class HTTPSProxyServer:
             await writer.wait_closed()
             return
         
-        client_address = writer.get_extra_info('peername')
+        # 获取socket的客户端地址（可能是HAProxy的地址）
+        socket_client_address = writer.get_extra_info('peername')
         self.stats.increment_connections()
         
+        # 创建带缓冲的StreamReader，用于PROXY Protocol检测
+        buffered_reader = BufferedStreamReader(reader)
+        
+        # 尝试解析PROXY Protocol v2，获取真实客户端IP
         try:
-            logger.info(f"客户端连接: {client_address}")
-            
+            real_client_address, connection_reset = await parse_proxy_protocol_v2(buffered_reader)
+            if connection_reset:
+                # 连接在PROXY Protocol检测时被重置（健康检查），直接退出
+                logger.debug(f"PROXY Protocol检测时连接被重置（可能是健康检查）: {socket_client_address}")
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except:
+                    pass
+                self.stats.decrement_connections()
+                self.connection_semaphore.release()
+                return
+            elif real_client_address:
+                # 成功解析PROXY Protocol，使用真实客户端IP
+                client_address = real_client_address
+                logger.info(f"PROXY Protocol解析成功: 真实客户端IP={client_address[0]}:{client_address[1]}, Socket地址={socket_client_address}")
+            else:
+                # 没有PROXY Protocol或LOCAL命令，使用socket的peername
+                # 注意：如果HAProxy发送了LOCAL命令，说明连接没有经过代理，应该使用socket的peername
+                # 但如果是真实客户端连接，HAProxy应该发送PROXY命令，而不是LOCAL命令
+                client_address = socket_client_address
+                logger.info(f"客户端连接（无PROXY Protocol或LOCAL命令）: {client_address}")
+        except Exception as e:
+            # PROXY Protocol解析出现异常，使用socket的peername
+            logger.warning(f"PROXY Protocol解析异常: {e}，使用Socket地址: {socket_client_address}")
+            client_address = socket_client_address
+        
+        try:
             while True:
                 # 使用wait_for实现keepalive超时机制
                 # 如果连接空闲时间超过keepalive_timeout，则关闭连接
                 try:
                     # 接收数据包（带keepalive超时）
-                    receive_task = asyncio.create_task(self.receive_packet(reader))
+                    receive_task = asyncio.create_task(self.receive_packet(buffered_reader))
                     encrypted_packet, error_type = await asyncio.wait_for(
                         receive_task,
                         timeout=self.keepalive_timeout
@@ -545,17 +865,23 @@ class HTTPSProxyServer:
                 # 检查接收结果
                 if encrypted_packet is None:
                     # 根据错误类型决定是否记录日志
-                    if error_type == 'magic_failed':
+                    if error_type == 'connection_reset':
+                        # 连接被重置（可能是健康检查），直接退出
+                        logger.debug(f"连接被重置（可能是健康检查）: {client_address}")
+                        break
+                    elif error_type == 'magic_failed':
                         # Magic验证失败，这是真正的错误，统计为拒绝连接
                         logger.warning(f"Magic验证失败，断开客户端连接: {client_address}")
                         self.stats.increment_rejected()
+                        break
                     elif error_type == 'normal_close':
                         # 客户端正常断开连接，不记录为错误
                         logger.debug(f"客户端正常断开连接: {client_address}")
+                        break
                     elif error_type:
                         # 其他错误（超时、异常等）
                         logger.debug(f"客户端断开连接 ({error_type}): {client_address}")
-                    break
+                        break
                 
                 self.stats.increment_requests()
                 
@@ -572,7 +898,7 @@ class HTTPSProxyServer:
                         error_response = encrypt_json({
                             'status_code': 503,
                             'headers': {},
-                            'body': 'Server busy, queue is full, please try again later'
+                            'body': ''
                         })
                         if not await self.send_packet(writer, error_response):
                             break
@@ -598,7 +924,7 @@ class HTTPSProxyServer:
                         error_response = encrypt_json({
                             'status_code': 503,
                             'headers': {},
-                            'body': 'Server busy, please try again later'
+                            'body': ''
                         })
                         if not await self.send_packet(writer, error_response):
                             break
@@ -624,7 +950,7 @@ class HTTPSProxyServer:
                         encrypted_response = encrypt_json({
                             'status_code': 504,
                             'headers': {},
-                            'body': 'Request processing timeout'
+                            'body': ''
                         })
                     
                     # 发送响应数据包（已经是加密的）
@@ -646,7 +972,7 @@ class HTTPSProxyServer:
                     error_response = encrypt_json({
                         'status_code': 500,
                         'headers': {},
-                        'body': f'Server error: {str(e)}'
+                        'body': ''
                     })
                     if not await self.send_packet(writer, error_response):
                         break

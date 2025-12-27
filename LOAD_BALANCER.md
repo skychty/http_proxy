@@ -178,14 +178,16 @@ backend https_proxy_backend
     option tcp-check
     
     # 后端服务器列表
-    server instance1 127.0.0.1:8888 check inter 2000 fall 3 rise 2
-    server instance2 127.0.0.1:8889 check inter 2000 fall 3 rise 2
-    server instance3 127.0.0.1:8890 check inter 2000 fall 3 rise 2
+    # 注意：send-proxy-v2 用于传递真实客户端IP（PROXY Protocol v2）
+    # 服务器端会自动解析PROXY Protocol并获取真实客户端IP
+    server instance1 127.0.0.1:8888 check inter 2000 fall 3 rise 2 send-proxy-v2
+    server instance2 127.0.0.1:8889 check inter 2000 fall 3 rise 2 send-proxy-v2
+    server instance3 127.0.0.1:8890 check inter 2000 fall 3 rise 2 send-proxy-v2
     
     # 如果是多机部署，使用IP地址：
-    # server instance1 192.168.1.10:8888 check inter 2000 fall 3 rise 2
-    # server instance2 192.168.1.11:8888 check inter 2000 fall 2000 rise 2
-    # server instance3 192.168.1.12:8888 check inter 2000 fall 3 rise 2
+    # server instance1 192.168.1.10:8888 check inter 2000 fall 3 rise 2 send-proxy-v2
+    # server instance2 192.168.1.11:8888 check inter 2000 fall 2000 rise 2 send-proxy-v2
+    # server instance3 192.168.1.12:8888 check inter 2000 fall 3 rise 2 send-proxy-v2
 ```
 
 #### 负载均衡算法说明
@@ -193,6 +195,35 @@ backend https_proxy_backend
 - **roundrobin**：轮询，依次分配请求到各后端
 - **leastconn**：最少连接，优先分配给连接数最少的后端（推荐）
 - **source**：源IP哈希，相同IP的请求总是转发到同一后端（保持会话）
+
+#### PROXY Protocol 说明
+
+**问题**：当使用HAProxy作为负载均衡器时，后端服务器看到的客户端IP都是HAProxy的地址（通常是127.0.0.1），无法获取真实客户端IP。
+
+**解决方案**：使用PROXY Protocol v2协议。
+
+1. **工作原理**：
+   - HAProxy在建立TCP连接时，先发送一个PROXY Protocol v2头，包含真实客户端IP和端口
+   - 后端服务器解析这个头，获取真实客户端IP
+   - 然后才处理正常的业务数据
+
+2. **配置方法**：
+   - 在HAProxy的`server`配置行中添加 `send-proxy-v2` 选项（已在上面配置示例中启用）
+   - 服务器端已自动支持PROXY Protocol v2解析，无需额外配置
+
+3. **日志验证**：
+   - 启用PROXY Protocol后，服务器日志会显示：
+     ```
+     PROXY Protocol解析成功: 真实客户端IP=xxx.xxx.xxx.xxx:xxxxx, Socket地址=('127.0.0.1', xxxxx)
+     ```
+   - 如果没有PROXY Protocol，会显示：
+     ```
+     客户端连接（无PROXY Protocol）: ('127.0.0.1', xxxxx)
+     ```
+
+4. **向后兼容**：
+   - 如果客户端直接连接服务器（不经过HAProxy），服务器会自动检测并跳过PROXY Protocol解析
+   - 不会影响直接连接的客户端
 
 #### 启动HAProxy
 
